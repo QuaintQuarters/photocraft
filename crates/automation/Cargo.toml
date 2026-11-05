@@ -28,6 +28,10 @@ getrandom = { workspace = true }
 cap-std = "4"
 clap = { workspace = true }
 
+# Opening an automation read without blocking on a FIFO (the flag constant only).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
 photocraft-geom = { workspace = true }
 # Synthetic camera raws (#7789).

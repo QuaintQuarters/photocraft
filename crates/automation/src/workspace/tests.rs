@@ -208,6 +208,54 @@ fn write_refuses_a_fifo_target_without_blocking() {
     assert!(temp_files(&inside).is_empty());
 }
 
+/// A FIFO under the read root is refused at once, directly or through a link: a read-only open
+/// of one without a writer used to block before the regular-file check, stalling the request
+/// (and the headless server's whole session behind its lock).
+#[cfg(unix)]
+#[test]
+fn read_refuses_a_fifo_without_blocking() {
+    let (inside, _, workspace) = roots("fifo-read");
+    let made = std::process::Command::new("mkfifo").arg(inside.join("pipe.png")).status();
+    if !made.is_ok_and(|s| s.success()) {
+        return; // no mkfifo on this system: nothing to assert
+    }
+    std::os::unix::fs::symlink("pipe.png", inside.join("link.png")).unwrap();
+    std::fs::write(inside.join("plain.png"), b"plain").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for name in ["pipe.png", "link.png", "plain.png"] {
+            let _ = tx.send((name, workspace.read(name).map_err(|e| e.to_string())));
+        }
+    });
+    for _ in 0..2 {
+        let (name, result) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("read blocked on a FIFO");
+        let error = result.unwrap_err();
+        assert!(error.contains("is not a regular file"), "{name}: {error}");
+    }
+    let (name, result) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("plain read finished");
+    assert_eq!(result.unwrap(), b"plain", "{name}: a regular file still reads normally with the non-blocking open");
+}
+
+/// The directory form of `.pcraft` reads its entries through the same non-blocking open: a FIFO
+/// standing in for `manifest.json` is refused, not waited on.
+#[cfg(unix)]
+#[test]
+fn open_pcraft_refuses_a_fifo_entry_without_blocking() {
+    let (inside, _, workspace) = roots("pcraft-fifo");
+    let bundle = inside.join("native.pcraft");
+    std::fs::create_dir_all(&bundle).unwrap();
+    let made = std::process::Command::new("mkfifo").arg(bundle.join("manifest.json")).status();
+    if !made.is_ok_and(|s| s.success()) {
+        return; // no mkfifo on this system: nothing to assert
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(workspace.open_pcraft("native.pcraft").map(|_| ()).map_err(|e| e.to_string()));
+    });
+    let error = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("open_pcraft blocked on a FIFO entry").unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+}
+
 /// #9401 review: replacing a file through the automation path keeps its creation time, the
 /// same as a save through `atomic_write` does on macOS (#9388).
 #[cfg(target_os = "macos")]

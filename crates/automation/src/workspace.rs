@@ -48,7 +48,7 @@ impl AuthorizedWorkspace {
     pub fn read(&self, path: &str) -> Result<Vec<u8>, AutomationError> {
         let relative = request_path(path, self.read.as_ref())?;
         let root = self.read.as_ref().ok_or_else(|| AutomationError::BadRequest(format!("{DENIED}: read authority is absent")))?;
-        let mut file = root.dir.open(&relative).map_err(|e| file_error("read", path, e))?;
+        let mut file = open_for_read(&root.dir, &relative).map_err(|e| file_error("read", path, e))?;
         let metadata = file.metadata().map_err(|e| file_error("read", path, e))?;
         if !metadata.is_file() {
             return Err(AutomationError::BadRequest(format!("automation read path is not a regular file: `{path}`")));
@@ -129,7 +129,7 @@ impl AuthorizedWorkspace {
                 use std::os::fd::AsFd;
                 // Best effort, and only when there is a file being replaced: a save still
                 // succeeds for a document whose Finder tag could not come along.
-                if let Ok(old) = root.dir.open(&relative) {
+                if let Ok(old) = open_for_read(&root.dir, &relative) {
                     let old = old.into_std();
                     let _ = photocraft_format::atomic::meta::copy_xattrs(old.as_fd(), file.as_fd());
                     // The creation time too (#9388), through the same handles.
@@ -171,6 +171,22 @@ impl Drop for TempRemoval<'_> {
     }
 }
 
+/// Open `relative` below `dir` for reading without blocking on a FIFO: opening one that has no
+/// writer read-only would otherwise wait until a writer appears, holding the request (and, for
+/// the headless server, every request queued behind its lock). On Unix `O_NONBLOCK` makes that
+/// open return at once; regular files ignore the flag. Callers still check the handle's own
+/// metadata and refuse anything but a regular file. Windows has no FIFOs in the file system.
+fn open_for_read(dir: &Dir, relative: impl AsRef<Path>) -> std::io::Result<cap_std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    dir.open_with(relative.as_ref(), &options)
+}
+
 /// Whether `name`'s extension is one of the formats PhotoCraft saves or exports.
 fn written_kind(name: &str) -> bool {
     let Some((_, ext)) = name.rsplit_once('.') else { return false };
@@ -182,7 +198,12 @@ fn written_kind(name: &str) -> bool {
 /// magic). Containers that also hold other things (zip, PDF) are judged by name only.
 fn holds_image(dir: &Dir, relative: &Path) -> bool {
     let mut head = [0u8; 64];
-    let Ok(mut file) = dir.open(relative) else { return false };
+    let Ok(mut file) = open_for_read(dir, relative) else { return false };
+    // The caller checked the path names a regular file; re-check the handle itself, since the
+    // file may have been swapped for a FIFO or device in between.
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let Ok(n) = file.read(&mut head) else { return false };
     let head = &head[..n];
     head.starts_with(b"8BPS") || photocraft_codecs::detect(head).is_some()
@@ -332,10 +353,11 @@ struct DirHandle {
 impl photocraft_format::ByteSource for DirHandle {
     fn get(&self, path: &str, max: usize) -> photocraft_format::Result<Vec<u8>> {
         let missing = || photocraft_format::FormatError::Corrupt(format!("missing `{path}`"));
-        let mut file = self.dir.open(path).map_err(|_| missing())?;
+        let mut file = open_for_read(&self.dir, path).map_err(|_| missing())?;
         let metadata = file.metadata().map_err(|_| missing())?;
         if !metadata.is_file() {
-            // A FIFO or device would block the open and stream without end.
+            // A FIFO or device would stream without end ([`open_for_read`] keeps it from
+            // blocking the open itself).
             return Err(photocraft_format::FormatError::Corrupt(format!("`{path}` is not a regular file")));
         }
         photocraft_format::read_entry(&mut file, metadata.len(), max, path)
