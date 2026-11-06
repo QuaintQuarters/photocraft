@@ -1063,3 +1063,41 @@ fn an_unconvertible_block_with_a_tail_still_writes_a_readable_tag() {
         assert_eq!(d.clone().into_bytes(order).unwrap().0, out, "into_bytes writes what to_bytes does");
     }
 }
+
+/// Found by the `image_source_data` fuzz target: layers read from a little-endian TIFF keep a block of
+/// unknown layout verbatim under a `MIB8` signature. Written big-endian it came first, so the reader
+/// took the tag for a little-endian one and failed. With no other block to lead, it is dropped with a
+/// warning (its data is little-endian, so a big-endian tag could not read it anyway).
+#[test]
+fn a_little_endian_block_is_dropped_from_big_endian_output_so_the_tag_still_reads() {
+    let mut data = b"Adobe Photoshop Document Data Block\0".to_vec();
+    data.extend_from_slice(
+        b"MIB8M\x08\x0063\x00\x00\x00\x00B\x008 Photoshop Doc\x00\x00M\x00\x00\xff\xff\xff\x08\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffM\x00[\x00\x00`\x9eP\x8a",
+    );
+    let (d, _) = ImageSourceData::from_bytes(&data).unwrap();
+    assert!(d.global_blocks.first().is_some_and(TaggedBlock::is_foreign_order), "{:?}", d.global_blocks);
+
+    let (big, warnings) = d.to_bytes(ByteOrder::Big).unwrap();
+    assert!(warnings.iter().any(|w| w.contains("little-endian")), "{warnings:?}");
+    let (again, _) = ImageSourceData::from_bytes(&big).expect("big-endian output reads");
+    assert_eq!(again.byte_order, ByteOrder::Big);
+    assert!(again.global_blocks.is_empty(), "{:?}", again.global_blocks);
+    assert_eq!(d.clone().into_bytes(ByteOrder::Big).unwrap().0, big);
+
+    // Little-endian output still keeps the block, as the TIFF it came from had it.
+    let (little, _) = d.to_bytes(ByteOrder::Little).unwrap();
+    let (back, _) = ImageSourceData::from_bytes(&little).expect("little-endian output reads");
+    assert_eq!(back.global_blocks.len(), 1);
+
+    // With another block after it, nothing is dropped: that block moves to the front and the
+    // marker block stays behind it, for a PSD writer to tell apart.
+    let mut mixed = d.clone();
+    let foreign_key = mixed.global_blocks[0].key;
+    mixed.global_blocks.push(TaggedBlock::new(*b"zOdd", vec![0, 0, 0, 1]));
+    let (big, warnings) = mixed.to_bytes(ByteOrder::Big).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (again, _) = ImageSourceData::from_bytes(&big).expect("mixed output reads");
+    assert_eq!(again.byte_order, ByteOrder::Big);
+    assert_eq!(again.global_blocks.iter().map(|b| b.key).collect::<Vec<_>>(), vec![*b"zOdd", foreign_key]);
+    assert!(again.global_blocks[1].is_foreign_order());
+}
