@@ -141,6 +141,7 @@ pub(crate) fn recorded_params(s: &Session, id: &str, mut p: Value) -> Value {
 /// the `.atn` event a Filter Gallery step remembers for Save Actions: the command, its journal
 /// entry (Last Filter), a smart filter and the step's dialog never see it.
 pub fn playback_params(s: &Session, id: &str, p: &Value) -> Result<Value> {
+    crate::doc_path::refuse_remote_step_paths(id, p, s.active().and_then(|d| d.path.as_deref()).map(std::path::Path::new))?;
     let mut p = p.clone();
     if id == "type.create" && (p.get("xPercent").is_some() || p.get("yPercent").is_some()) {
         if p.get("box").is_some() || p.get("x").is_some() || p.get("y").is_some() {

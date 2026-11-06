@@ -222,7 +222,17 @@ impl ImageSourceData {
         let signature = if version.is_psb() { SIGNATURE_PSB } else { SIGNATURE };
         let blocks = body.get(signature.len()..).ok_or_else(|| PsdError::invalid("image source data without its signature"))?;
         // Converted behind the signature, into one buffer sized for both.
-        transcode::transcode_blocks_after(signature, blocks, version, ByteOrder::Big, ByteOrder::Little)
+        let (mut out, mut warnings) = transcode::transcode_blocks_after(signature, blocks, version, ByteOrder::Big, ByteOrder::Little)?;
+        // Bytes that do not form a block are copied as they are, but a reader needs the first
+        // block's signature to tell the byte order. When every block was dropped as unconvertible,
+        // only that opaque tail is left, and the tag would no longer read at all (the file would
+        // open flattened). Without a block it is meaningless, so it goes too.
+        let tail = out.get(signature.len()..).unwrap_or_default();
+        if tail.len() >= 4 && !tail.starts_with(b"MIB8") && !tail.starts_with(b"46B8") {
+            warnings.push(format!("{} bytes after the last block dropped: no block could be converted, and they do not form one", tail.len()));
+            out.truncate(signature.len());
+        }
+        Ok((out, warnings))
     }
 
     /// The layers, global mask and global blocks of a PSD as image source data (byte order Big).

