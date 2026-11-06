@@ -1041,3 +1041,25 @@ fn a_nested_block_that_fails_part_way_leaves_nothing_behind() {
     assert_eq!(w.iter().filter(|w| w.starts_with("lfx2 block")).count(), 1, "{w:?}");
     assert_eq!(little, clean.to_bytes(ByteOrder::Little).unwrap().0);
 }
+
+/// Found by the `image_source_data` fuzz target: a block of unknown layout cannot be converted to
+/// little-endian, so it is dropped, and the opaque bytes after it were then written first. The
+/// reader takes the first block's signature as the byte order and refused the tag, so a layered
+/// TIFF saved this way opened flattened. Whatever parses must write and parse again, in both orders.
+#[test]
+fn an_unconvertible_block_with_a_tail_still_writes_a_readable_tag() {
+    let data: &[u8] = b"Adobe Photoshop Document Data Block\x008BIM\x8a\x07\x00\x07\x00\x00\x00\x10\x00\x00\x00M\x00T'TTTTTTT9TTTTTTTTT%TTT\x07\xd5";
+    let (d, _) = ImageSourceData::from_bytes(data).unwrap();
+    assert_eq!((d.global_blocks.len(), d.trailing.len()), (1, 14));
+    for order in [ByteOrder::Big, ByteOrder::Little] {
+        let (out, warnings) = d.to_bytes(order).unwrap();
+        let (again, _) = ImageSourceData::from_bytes(&out).unwrap_or_else(|e| panic!("{order:?}: {e}"));
+        if order.is_little() {
+            assert!(warnings.iter().any(|w| w.contains("dropped")), "{warnings:?}");
+            assert!(again.global_blocks.is_empty() && again.trailing.is_empty(), "{again:?}");
+        } else {
+            assert_eq!(again, d, "big-endian output is lossless");
+        }
+        assert_eq!(d.clone().into_bytes(order).unwrap().0, out, "into_bytes writes what to_bytes does");
+    }
+}
