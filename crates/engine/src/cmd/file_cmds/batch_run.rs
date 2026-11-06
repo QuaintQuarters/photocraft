@@ -601,6 +601,7 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
                             }
                             continue;
                         }
+                        crate::doc_path::refuse_remote_step_paths(id, params, Some(source.as_str()).filter(|s| !s.is_empty()).map(std::path::Path::new))?;
                         let result = scratch.execute(id, params.clone())?;
                         ctx.publish_batch_preview(&source, scratch.active().map(|state| state.doc.clone()));
                         if let Some(error) = crate::actions_cmds::nested_failure(id, &result) {

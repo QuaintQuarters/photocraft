@@ -137,7 +137,8 @@ fn run_steps(s: &mut Session, steps: &[(String, Value)]) -> Vec<Value> {
             results.push(json!({"command": id, "error": format!("the script ran more than {MAX_SCRIPT_STEPS} steps in all (scripts calling scripts)")}));
             break;
         }
-        match s.execute(id, params.clone()) {
+        let remote = crate::doc_path::refuse_remote_step_paths(id, params, s.active().and_then(|d| d.path.as_deref()).map(std::path::Path::new));
+        match remote.and_then(|()| s.execute(id, params.clone())) {
             // A called action reports a failed step inside an `Ok`; it stops the script too.
             Ok(r) => match crate::actions_cmds::nested_failure(id, &r).or_else(|| nested_script_failure(id, &r)) {
                 Some(error) => {

@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-pub use photocraft_io::doc_path::NotFollowed;
+pub use photocraft_io::doc_path::{NotFollowed, Refused};
 
 thread_local! {
     static DOCUMENT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
@@ -47,6 +47,42 @@ pub fn resolve(stored: &str) -> Result<PathBuf, NotFollowed> {
 /// The file to open for `stored`, a path stored in the document saved at `document`.
 pub fn resolve_in(stored: &str, document: Option<&Path>) -> Result<PathBuf, NotFollowed> {
     photocraft_io::doc_path::resolve(stored, document)
+}
+
+/// Parameter names that carry a file or folder a played step reads or writes.
+const PATH_KEYS: &[&str] =
+    &["path", "paths", "file", "files", "folder", "dir", "directory", "source", "destination", "output", "input", "src", "dest", "target"];
+
+/// Played steps (an action, a script, a droplet, a batch) carry paths that came from a file the
+/// user loaded, not from the user. This refuses a step that names a file on another computer, a
+/// device or a URL, so playing a loaded action never contacts a server the user did not choose
+/// (Windows sends the user's login hash to the server of a `\\host\share` path). A path on the
+/// share of the document being worked on (`document`) is allowed. Local paths are not touched,
+/// and neither is a command the user runs directly: only playback calls this.
+///
+/// The check is lexical, as [`resolve_in`] is: a mapped drive letter or a link on the disk can
+/// still lead to another computer.
+pub fn refuse_remote_step_paths(id: &str, params: &serde_json::Value, document: Option<&Path>) -> crate::Result<()> {
+    fn walk(id: &str, v: &serde_json::Value, key_is_path: bool, document: Option<&Path>, depth: usize) -> crate::Result<()> {
+        if depth > 8 {
+            return Ok(());
+        }
+        match v {
+            serde_json::Value::String(s) if key_is_path && !s.is_empty() => match resolve_in(s, document) {
+                Err(NotFollowed::Refused(why @ (Refused::Network | Refused::Device | Refused::Url))) => Err(crate::EngineError::Other(format!(
+                    "step `{id}` was not run: its path {s} is not on this computer ({why}). Playback only follows local paths; \
+                     run the step yourself if you trust the path"
+                ))),
+                _ => Ok(()),
+            },
+            serde_json::Value::Array(items) => items.iter().try_for_each(|item| walk(id, item, key_is_path, document, depth + 1)),
+            serde_json::Value::Object(map) => {
+                map.iter().try_for_each(|(k, item)| walk(id, item, PATH_KEYS.contains(&k.as_str()), document, depth + 1))
+            }
+            _ => Ok(()),
+        }
+    }
+    walk(id, params, false, document, 0)
 }
 
 /// The message for a stored path that is not followed.
