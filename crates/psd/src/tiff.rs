@@ -152,21 +152,46 @@ impl ImageSourceData {
     /// Serializes the data in `order`. Returns the bytes and warnings about blocks that were
     /// dropped because they could not be converted to a little-endian layout.
     pub fn to_bytes(&self, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
-        Self::finish(self.body()?, self.version, order)
+        let (body, warnings) = self.body(order)?;
+        Self::finish(body, warnings, self.version, order)
     }
 
     /// [`Self::to_bytes`] that frees the layers once their block is written, before the bytes
     /// are converted to `order` (a copy of them all): a layered TIFF save holds them one time
     /// fewer (#6607).
     pub fn into_bytes(self, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
-        let (body, version) = (self.body()?, self.version);
+        let (body, warnings) = self.body(order)?;
+        let version = self.version;
         drop(self);
-        Self::finish(body, version, order)
+        Self::finish(body, warnings, version, order)
     }
 
-    /// The signature, then the blocks in big-endian order.
-    fn body(&self) -> Result<Vec<u8>> {
+    /// The signature, then the blocks in big-endian order, and warnings about what was left out.
+    ///
+    /// Blocks kept verbatim from a little-endian TIFF (`MIB8` / `46B8`, layout unknown) stay in
+    /// the data, so a PSD writer can tell them apart. A reader takes the first block's signature
+    /// for the byte order, though, so written big-endian none may come first: another block is
+    /// moved to the front, and when there is none they are dropped (their data is little-endian,
+    /// so they cannot be read from a big-endian tag anyway).
+    fn body(&self, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
         let version = self.version;
+        let mut warnings = Vec::new();
+        let mut blocks: Vec<&TaggedBlock> = self.global_blocks.iter().collect();
+        let leads = self.layer_info.is_some() || self.global_layer_mask.is_some();
+        if !order.is_little() && !leads && blocks.first().is_some_and(|b| b.is_foreign_order()) {
+            if let Some(i) = blocks.iter().position(|b| !b.is_foreign_order()) {
+                let first = blocks.remove(i);
+                blocks.insert(0, first);
+            } else {
+                for b in blocks.drain(..) {
+                    warnings.push(format!(
+                        "{} block ({} bytes) dropped: its data is little-endian and nothing else could lead a big-endian tag",
+                        String::from_utf8_lossy(&b.key),
+                        b.data.len()
+                    ));
+                }
+            }
+        }
         let signature = if version.is_psb() { SIGNATURE_PSB } else { SIGNATURE };
         let len_field = |key: &[u8; 4]| if uses_long_length(version, key) { 8u64 } else { 4 };
         // Reserved at its exact length, as the buffer holds all the layers' pixels: one that is a
@@ -184,7 +209,7 @@ impl ImageSourceData {
             let pad = TaggedBlock::default_padding(m.data.len(), 4);
             len = len.saturating_add(8 + len_field(b"LMsk")).saturating_add(m.data.len() as u64).saturating_add(pad as u64);
         }
-        len = self.global_blocks.iter().fold(len, |n, b| n.saturating_add(b.encoded_len_aligned(version, 4) as u64));
+        len = blocks.iter().fold(len, |n, b| n.saturating_add(b.encoded_len_aligned(version, 4) as u64));
         len = len.saturating_add(self.trailing.len() as u64);
         let no_memory = || PsdError::OutOfMemory("not enough memory for the layer data");
         let mut body = Vec::new();
@@ -207,22 +232,31 @@ impl ImageSourceData {
         if let Some(m) = &self.global_layer_mask {
             TaggedBlock::write_parts(&mut body, *b"8BIM", *b"LMsk", &m.data, None, version, 4)?;
         }
-        for b in &self.global_blocks {
+        for b in &blocks {
             b.write(&mut body, version, 4)?;
         }
         body.put(&self.trailing);
-        Ok(body)
+        // The reader takes the first block's signature for the byte order and refuses anything
+        // else (4 bytes or more) there. When no block is left to give the tail one, it is
+        // meaningless and would make the tag unreadable, so it goes.
+        let tail = body.get(signature.len()..).unwrap_or_default();
+        if !order.is_little() && tail.len() >= 4 && !tail.starts_with(b"8BIM") && !tail.starts_with(b"8B64") {
+            warnings.push(format!("{} bytes after the last block dropped: no block is left, and they do not form one", tail.len()));
+            body.truncate(signature.len());
+        }
+        Ok((body, warnings))
     }
 
     /// The `body` (signature included) converted to `order`.
-    fn finish(body: Vec<u8>, version: Version, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
+    fn finish(body: Vec<u8>, mut warnings: Vec<String>, version: Version, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
         if !order.is_little() {
-            return Ok((body, Vec::new()));
+            return Ok((body, warnings));
         }
         let signature = if version.is_psb() { SIGNATURE_PSB } else { SIGNATURE };
         let blocks = body.get(signature.len()..).ok_or_else(|| PsdError::invalid("image source data without its signature"))?;
         // Converted behind the signature, into one buffer sized for both.
-        let (mut out, mut warnings) = transcode::transcode_blocks_after(signature, blocks, version, ByteOrder::Big, ByteOrder::Little)?;
+        let (mut out, converted) = transcode::transcode_blocks_after(signature, blocks, version, ByteOrder::Big, ByteOrder::Little)?;
+        warnings.extend(converted);
         // Bytes that do not form a block are copied as they are, but a reader needs the first
         // block's signature to tell the byte order. When every block was dropped as unconvertible,
         // only that opaque tail is left, and the tag would no longer read at all (the file would
