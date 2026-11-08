@@ -76,9 +76,7 @@ pub fn refuse_remote_step_paths(id: &str, params: &serde_json::Value, document: 
                 _ => Ok(()),
             },
             serde_json::Value::Array(items) => items.iter().try_for_each(|item| walk(id, item, key_is_path, document, depth + 1)),
-            serde_json::Value::Object(map) => {
-                map.iter().try_for_each(|(k, item)| walk(id, item, PATH_KEYS.contains(&k.as_str()), document, depth + 1))
-            }
+            serde_json::Value::Object(map) => map.iter().try_for_each(|(k, item)| walk(id, item, PATH_KEYS.contains(&k.as_str()), document, depth + 1)),
             _ => Ok(()),
         }
     }
